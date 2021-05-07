@@ -23,7 +23,7 @@ func (s *Server) cachedTotalSupply() (interface{}, error) {
 }
 
 func (s *Server) Serve() error {
-	http.HandleFunc("/totalcoins", func(w http.ResponseWriter, req *http.Request) {
+	http.HandleFunc("/v1/circulating", func(w http.ResponseWriter, req *http.Request) {
 		result, err, _ := s.cache.Memoize(req.URL.Path, s.cachedTotalSupply)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
