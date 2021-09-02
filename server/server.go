@@ -19,24 +19,61 @@ type Server struct {
 }
 
 func (s *Server) cachedTotalSupply() (interface{}, error) {
-	return s.client.GetTotalSupply()
+	return s.client.GetSupplies()
+}
+
+func writeError(w http.ResponseWriter, err error) {
+	w.WriteHeader(http.StatusInternalServerError)
+	_, wErr := w.Write([]byte(err.Error()))
+	if wErr != nil {
+		log.Printf("Can't write error %q: %q\n", err.Error(), wErr.Error())
+		return
+	}
+	log.Printf("Error: %q\n", err.Error())
+}
+
+func writeFloat(w http.ResponseWriter, f float64) {
+	w.WriteHeader(http.StatusAccepted)
+	w.Header().Add("Content-Type", "text/plain; charset=UTF-8")
+	str := strconv.FormatFloat(f, 'f', -1, 64)
+	_, err := w.Write([]byte(str))
+	if err != nil {
+		log.Printf("Can't write response: %q\n", err.Error())
+	}
 }
 
 func (s *Server) Serve() error {
-	http.HandleFunc("/v1/circulating", func(w http.ResponseWriter, req *http.Request) {
+	http.HandleFunc("/v2/circulating", func(w http.ResponseWriter, req *http.Request) {
 		result, err, _ := s.cache.Memoize(req.URL.Path, s.cachedTotalSupply)
 		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = w.Write([]byte(err.Error()))
-			log.Println(err.Error())
+			writeError(w, err)
 			return
 		}
 
-		w.WriteHeader(http.StatusAccepted)
-		w.Header().Add("Content-Type", "text/plain; charset=UTF-8")
-		ts := result.(*float64)
-		totalSupplyString := strconv.FormatFloat(*ts, 'f', -1, 64)
-		_, _ = w.Write([]byte(totalSupplyString))
+		tr := result.(*ldfi.Supplies)
+		writeFloat(w, tr.Circulating)
+	})
+
+	http.HandleFunc("/v2/total", func(w http.ResponseWriter, req *http.Request) {
+		result, err, _ := s.cache.Memoize(req.URL.Path, s.cachedTotalSupply)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+
+		tr := result.(*ldfi.Supplies)
+		writeFloat(w, tr.Total)
+	})
+
+	http.HandleFunc("/v2/max", func(w http.ResponseWriter, req *http.Request) {
+		result, err, _ := s.cache.Memoize(req.URL.Path, s.cachedTotalSupply)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+
+		tr := result.(*ldfi.Supplies)
+		writeFloat(w, tr.Max)
 	})
 
 	log.Println("Listen to http server:", s.address)

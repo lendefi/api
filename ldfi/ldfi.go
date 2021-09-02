@@ -11,62 +11,84 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-/*
-	calculateTotalSupply the total supply of all LDFI tokens in wei
+type multiAccountBalanceError struct {
+	client *Client
+	err    error
+}
 
-	ETH total minus:
-	- vesting
-	- project wallet balance in ETH chain
-	- project wallet balance in BSC chain
-*/
-func calculateTotalSupply(ethLDFITotal, ethVestingTotal, ethProjectBalance, bscProjectBalance *big.Int) (totalSupply *big.Int) {
-	totalSupply = ethLDFITotal.Sub(ethLDFITotal, ethVestingTotal)
-	totalSupply.Sub(totalSupply, ethProjectBalance)
-	totalSupply.Sub(totalSupply, bscProjectBalance)
-	return
+func (m *multiAccountBalanceError) Error() string {
+	return fmt.Sprintf(
+		"eth.MultiAccountBalance(%q, %q, %q, %q): %q",
+		m.client.token,
+		m.client.vestingContract,
+		m.client.projectWallet,
+		m.client.burnAddress,
+		m.err.Error(),
+	)
 }
 
 // Client connect to BSC and ETH chains explorers
 type Client struct {
 	// API client for bscscan.com
-	bsc *etherscan.Client
-	// API client for etherscan.com
-	eth *etherscan.Client
-	// address of the LDFI token on ETH
-	ethToken string
-	// address of the LDFI token on BSC
-	bscToken string
-	// address of the project wallet on both chains
+	client *etherscan.Client
+	// address of the LDFI token
+	token string
+	// address of the project wallet
 	projectWallet string
 	// address of vesting contract on ETH chain
 	vestingContract string
+	// address where token goes to die
+	burnAddress string
 	// decimals of the token
 	decimals uint
+	// max supply
+	maxSupply etherscan.BigInt
 }
 
 // NewClient create new instance of Client
-func NewClient(etherscanAPIkey, bscscanAPIkey string) *Client {
+func NewClient(bscscanAPIkey string) *Client {
 	return &Client{
-		eth: etherscan.New(etherscan.Mainnet, etherscanAPIkey),
-		bsc: etherscan.NewCustomized(etherscan.Customization{
+		client: etherscan.NewCustomized(etherscan.Customization{
 			Timeout: time.Second * 5,
 			Key:     bscscanAPIkey,
 			BaseURL: "https://api.bscscan.com/api?",
 			Verbose: false,
 		}),
-		ethToken:        "0x5479d565e549f3ecdbde4ab836d02d86e0d6a8c7",
-		bscToken:        "0xae1119b918f971f232fed504d48604d5fef7277f",
-		projectWallet:   "0x9200F737DE4D0BdAdCe8EF83c9f7f1A087569456",
-		vestingContract: "0xcE8996314F80200974Bba394Caa19Fc1D41225F9",
+		token:           "0x8f1e60d84182db487ac235acc65825e50b5477a1",
+		projectWallet:   "0x30DD781D2143fE32C36E894a049898f268b82092",
+		vestingContract: "0xc598d81c62f6391b2412d02a78fa3f3affe58b52",
+		burnAddress:     "0x000000000000000000000000000000000000dead",
 		decimals:        18,
 	}
 }
 
-// GetTotalSupply get from the ETH and BSC scanners the total supply
-func (l *Client) GetTotalSupply() (*float64, error) {
+func (l *Client) weiToFloat(i *big.Int) float64 {
+	bf := new(big.Float)
+	bf.SetInt(i)
+	quotient := new(big.Float).SetInt(big.NewInt(int64(math.Pow10(int(l.decimals)))))
+	bf.Quo(bf, quotient)
+	output, _ := bf.Float64()
+	return output
+}
+
+type Supplies struct {
+	Total       float64
+	Circulating float64
+	Max         float64
+}
+
+func copyBigInt(i *big.Int) (o *big.Int) {
+	o = new(big.Int)
+	o = o.Set(i)
+	return
+}
+
+// GetSupplies get BSC scanners total and circulating supplies
+func (l *Client) GetSupplies() (*Supplies, error) {
+	l.client.EtherTotalSupply()
 	var (
-		ethLDFI, ethVesting, ethProjectBalance, bscProjectBalance *etherscan.BigInt
-		group                                                     errgroup.Group
+		maxSupply, burnBalance, vesting, projectBalance *etherscan.BigInt
+		group                                           errgroup.Group
 	)
 
 	/*
@@ -75,33 +97,28 @@ func (l *Client) GetTotalSupply() (*float64, error) {
 
 	// get total supply of LDFI on ETH
 	group.Go(func() (err error) {
-		if ethLDFI, err = l.eth.TokenTotalSupply(l.ethToken); err != nil {
-			return fmt.Errorf("eth.TokenTotalSupply(%q): %w", l.ethToken, err)
+		if maxSupply, err = l.client.TokenTotalSupply(l.token); err != nil {
+			return fmt.Errorf("client.TokenTotalSupply(%q): %w", l.token, err)
 		}
 		return nil
 	})
 
-	// get total balance of vesting contract on ETH
+	// get balances
 	group.Go(func() (err error) {
-		if ethVesting, err = l.eth.TokenBalance(l.ethToken, l.vestingContract); err != nil {
-			return fmt.Errorf("eth.TokenBalance(%q, %q): %w", l.ethToken, l.vestingContract, err)
+		balances, err := l.client.MultiAccountBalance(l.token, l.vestingContract, l.projectWallet, l.burnAddress)
+		if err != nil {
+			return &multiAccountBalanceError{client: l, err: err}
 		}
-		return nil
-	})
 
-	// get balance of project wallet on BSC
-	group.Go(func() (err error) {
-		if ethProjectBalance, err = l.eth.TokenBalance(l.ethToken, l.projectWallet); err != nil {
-			return fmt.Errorf("eth.TokenBalance(%q, %q): %w", l.ethToken, l.projectWallet, err)
+		lenBalances := len(balances)
+		if lenBalances != 4 {
+			return &multiAccountBalanceError{client: l, err: fmt.Errorf("Invalid number of balances %d, expected 4", lenBalances)}
 		}
-		return nil
-	})
 
-	// get balance of project wallet on BSC
-	group.Go(func() (err error) {
-		if bscProjectBalance, err = l.bsc.TokenBalance(l.bscToken, l.projectWallet); err != nil {
-			return fmt.Errorf("bsc.TokenBalance(%q, %q): %w", l.bscToken, l.projectWallet, err)
-		}
+		vesting = balances[0].Balance
+		projectBalance = balances[1].Balance
+		burnBalance = balances[2].Balance
+
 		return nil
 	})
 
@@ -113,44 +130,35 @@ func (l *Client) GetTotalSupply() (*float64, error) {
 
 	// no requests failure
 
-	weiSupply := calculateTotalSupply(
-		ethLDFI.Int(),
-		ethVesting.Int(),
-		ethProjectBalance.Int(),
-		bscProjectBalance.Int(),
-	)
+	// Total Supply = Max Supply minus Burnt Tokens
+	totalSupply := copyBigInt(maxSupply.Int())
+	totalSupply = totalSupply.Sub(totalSupply, burnBalance.Int())
 
-	// convert to tokens
-	bf := new(big.Float)
-	bf.SetInt(weiSupply)
-	quotient := new(big.Float).SetInt(big.NewInt(int64(math.Pow10(int(l.decimals)))))
-	bf.Quo(bf, quotient)
+	// Circulating Supply = Total Supply minus Vesting Contract minus Project Wallet
+	calculateTotalSupply := copyBigInt(maxSupply.Int())
+	calculateTotalSupply = calculateTotalSupply.Sub(calculateTotalSupply, vesting.Int())
+	calculateTotalSupply = calculateTotalSupply.Sub(calculateTotalSupply, projectBalance.Int())
 
-	f, _ := bf.Float64()
-	return &f, nil
+	return &Supplies{
+		Total:       l.weiToFloat(totalSupply),
+		Circulating: l.weiToFloat(calculateTotalSupply),
+		Max:         l.weiToFloat(maxSupply.Int()),
+	}, nil
 }
 
 // NewClientFromEnv is like NewLDFIClient but initialize itself through environment variables.
 // API_ETHERSCAN for etherscan.com and API_BSCSCAN for bscscan.com
 func NewClientFromEnv() (*Client, error) {
 	const (
-		envKeyETH                      = "API_ETHERSCAN"
 		envKeyBSC                      = "API_BSCSCAN"
 		errFormatMissingEnvironmentKey = "Missing environment key %q"
 	)
 
-	var (
-		ethAPIKey = os.Getenv(envKeyETH)
-		bscAPIKey = os.Getenv(envKeyBSC)
-	)
-
-	if len(ethAPIKey) == 0 {
-		return nil, fmt.Errorf(errFormatMissingEnvironmentKey, envKeyETH)
-	}
+	bscAPIKey := os.Getenv(envKeyBSC)
 
 	if len(bscAPIKey) == 0 {
 		return nil, fmt.Errorf(errFormatMissingEnvironmentKey, envKeyBSC)
 	}
 
-	return NewClient(ethAPIKey, bscAPIKey), nil
+	return NewClient(bscAPIKey), nil
 }
