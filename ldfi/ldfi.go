@@ -2,6 +2,7 @@ package ldfi
 
 import (
 	"fmt"
+	"log"
 	"math"
 	"math/big"
 	"os"
@@ -11,21 +12,7 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-type multiAccountBalanceError struct {
-	client *Client
-	err    error
-}
-
-func (m *multiAccountBalanceError) Error() string {
-	return fmt.Sprintf(
-		"eth.MultiAccountBalance(%q, %q, %q, %q): %q",
-		m.client.token,
-		m.client.vestingContract,
-		m.client.projectWallet,
-		m.client.burnAddress,
-		m.err.Error(),
-	)
-}
+const baseDecimal = 10
 
 // Client connect to BSC and ETH chains explorers
 type Client struct {
@@ -98,28 +85,31 @@ func (l *Client) GetSupplies() (*Supplies, error) {
 	// get total supply of LDFI on ETH
 	group.Go(func() (err error) {
 		if maxSupply, err = l.client.TokenTotalSupply(l.token); err != nil {
-			return fmt.Errorf("client.TokenTotalSupply(%q): %w", l.token, err)
+			err = fmt.Errorf("client.TokenTotalSupply(%q): %w", l.token, err)
 		}
-		return nil
+		return
 	})
 
 	// get balances
 	group.Go(func() (err error) {
-		balances, err := l.client.MultiAccountBalance(l.token, l.vestingContract, l.projectWallet, l.burnAddress)
-		if err != nil {
-			return &multiAccountBalanceError{client: l, err: err}
+		if vesting, err = l.client.TokenBalance(l.token, l.vestingContract); err != nil {
+			err = fmt.Errorf("client.TokenTotalSupply(%q): %w", l.token, err)
 		}
+		return
+	})
 
-		lenBalances := len(balances)
-		if lenBalances != 4 {
-			return &multiAccountBalanceError{client: l, err: fmt.Errorf("Invalid number of balances %d, expected 4", lenBalances)}
+	group.Go(func() (err error) {
+		if projectBalance, err = l.client.TokenBalance(l.token, l.projectWallet); err != nil {
+			err = fmt.Errorf("client.TokenTotalSupply(%q): %w", l.token, err)
 		}
+		return
+	})
 
-		vesting = balances[0].Balance
-		projectBalance = balances[1].Balance
-		burnBalance = balances[2].Balance
-
-		return nil
+	group.Go(func() (err error) {
+		if burnBalance, err = l.client.TokenBalance(l.token, l.burnAddress); err != nil {
+			err = fmt.Errorf("client.TokenTotalSupply(%q): %w", l.token, err)
+		}
+		return
 	})
 
 	// run all requests
@@ -135,13 +125,23 @@ func (l *Client) GetSupplies() (*Supplies, error) {
 	totalSupply = totalSupply.Sub(totalSupply, burnBalance.Int())
 
 	// Circulating Supply = Total Supply minus Vesting Contract minus Project Wallet
-	calculateTotalSupply := copyBigInt(maxSupply.Int())
-	calculateTotalSupply = calculateTotalSupply.Sub(calculateTotalSupply, vesting.Int())
-	calculateTotalSupply = calculateTotalSupply.Sub(calculateTotalSupply, projectBalance.Int())
+	circulatingSupply := copyBigInt(totalSupply)
+	circulatingSupply = circulatingSupply.Sub(circulatingSupply, vesting.Int())
+	circulatingSupply = circulatingSupply.Sub(circulatingSupply, projectBalance.Int())
+
+	log.Printf(
+		"vesting:%q project:%q burn:%q circulating=%q total=%q max=%q\n",
+		vesting.Int().Text(baseDecimal),
+		projectBalance.Int().Text(baseDecimal),
+		burnBalance.Int().Text(baseDecimal),
+		circulatingSupply.Text(baseDecimal),
+		totalSupply.Text(baseDecimal),
+		maxSupply.Int().Text(baseDecimal),
+	)
 
 	return &Supplies{
 		Total:       l.weiToFloat(totalSupply),
-		Circulating: l.weiToFloat(calculateTotalSupply),
+		Circulating: l.weiToFloat(circulatingSupply),
 		Max:         l.weiToFloat(maxSupply.Int()),
 	}, nil
 }
